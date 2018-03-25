@@ -21,6 +21,10 @@
 #include <locale.h>
 #include <stdarg.h>
 
+#define XK_SPECIAL
+#define XK_PUBLISHING
+#define XK_TECHNICAL
+
 #include <X11/Xlib.h>
 #include <X11/XKBlib.h>
 #include <X11/Xatom.h>
@@ -32,6 +36,8 @@
 #include <X11/cursorfont.h>
 
 #include <xkbcommon/xkbcommon.h>
+
+#include <wchar.h>
 
 #include "xdo.h"
 #include "xdo_util.h"
@@ -955,7 +961,13 @@ int xdo_click_window_multiple(const xdo_t *xdo, Window window, int button,
 } /* int xdo_click_window_multiple */
 
 /* XXX: Return proper code if errors found */
-int xdo_enter_text_window(const xdo_t *xdo, Window window, const char *string, useconds_t delay) {
+int xdo_enter_text_window(const xdo_t *xdo, Window window, const char *str, useconds_t delay) {
+  uint32_t i, j;
+  int r;
+  char map = 0;
+  unsigned char *s, *u;
+  unsigned char utf[7]; /* old max number of multi-byte encoded utf8 bytes for chars (6) + '\0'
+                           (by current standard it is lower, 4; lets play safe) */
 
   /* Since we're doing down/up, the delay should be based on the number
    * of keys pressed (including shift). Since up/down is two calls,
@@ -969,15 +981,184 @@ int xdo_enter_text_window(const xdo_t *xdo, Window window, const char *string, u
   //int modifier = 0;
   setlocale(LC_CTYPE,"");
   mbstate_t ps = { 0 };
-  ssize_t len;
-  while ( (len = mbsrtowcs(&key.key, &string, 1, &ps)) ) {
-    if (len == -1) {
-      fprintf(stderr, "Invalid multi-byte sequence encountered\n");
-      return XDO_ERROR;
+  size_t len = strlen(str);
+
+  for (s = (unsigned char *)str ; *str ; len -= (s - (unsigned char *)str), str = (char *)s) {
+    if ((i = *(unsigned char*)s) == '\\') {
+      j = 4; /* For some numerical codes, max bytes skips on string position */
+
+      switch (*++s) {
+      case '\\':
+        s++;
+      case '\0':
+        break;
+      case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': /* up to 3 octal digits */
+        for (i = 0 ; isdigit(*s) && *s < '8' && (s - (unsigned char *)str) < 4 ; i = (i<<3) + (*s - '0'), s++) ;
+        if (i > 0xff) {
+          fprintf(stderr, "Ignoring invalid octal constant: '%.*s'.\n", (int)(s - (unsigned char *)str), str);
+          continue;
+        }
+        break;
+      case '#': /* up to 3 decimal digits */
+        for (s++, i = 0 ; isdigit(*s) && (s - (unsigned char *)str) < 5 ; i = (i*10) + (*s - '0'), s++) ;
+        if (i > 0xff || (s - (unsigned char *)str) < 3) {
+          fprintf(stderr, "Ignoring invalid decimal constant: '%.*s'.\n", (int)(s - (unsigned char *)str), str);
+          continue;
+        }
+        break;
+      case 'U': /* up to 8 hexadecimal digits */
+        j += 4;
+      case 'u': /* up to 4 hexadecimal digits */
+        j += 2;
+      case 'x': /* up to 2 hexadecimal digits */
+        for (s++, i = 0 ; isxdigit(*s) && (s - (unsigned char *)str) < j ; i = (i<<4) + (isdigit(*s) ? *s - '0' : tolower(*s) - 'a' + 10), s++) ;
+        if ((s - (unsigned char *)str) < 3) {
+          fprintf(stderr, "Ignoring invalid hexadecimal constant: '%.*s'\n", (int)(s - (unsigned char *)str), str);
+          continue;
+        }
+        break;
+      case 'A': /* ANSI-HTML mapping */
+        map |= 1;
+        s++;
+        continue;
+      case 'T': /* UTF-8 encoding (default) */
+        map &= ~1;
+        s++;
+        continue;
+#ifdef HTML_SYMBOLS
+      case 'H': /* HTML entities interpretation enable */
+        map |= 2;
+        s++;
+        continue;
+      case 'L': /* HTML entities interpretation disable */
+        map &= ~2;
+        s++;
+        continue;
+#endif
+      default:
+        if ((s = (unsigned char *)strchr(escC, *s)) != NULL) {
+          i = escC_map[(char *)s - escC];
+          s = (unsigned char *)str + 2;
+        }
+        else if (map & 1)
+          i = *s++;
+        else {
+          len--;
+          i = *(s = (unsigned char *)++str); /* process what can be a multi-byte encoded character with system conversion functions */
+        }
+      }
     }
+#ifdef HTML_SYMBOLS
+    else if (i == '&' && (map & 2)) {
+      if (*++s == '#') {
+        if (isdigit(s[1]))
+          for (j = 3, s++, i = 0 ; isdigit(*s) ; i = (i*10) + (*s - '0'), s++) ;
+        else if (tolower(s[1]) == 'x')
+          for (j = 4, s += 2, i = 0 ; isxdigit(*s) ; i = (i<<4) + (isdigit(*s) ? *s - '0' : tolower(*s) - 'a' + 10), s++) ;
+        else
+          for (j = 3, s++ ; isxdigit(*s) ; s++, j++) ; /* wind through malformed constant */
+        if (*s != ';' || (s - (unsigned char *)str) < j) {
+          fprintf(stderr, "Ignoring invalid html symbol constant: '%.*s'\n", (int)(s - (unsigned char *)str + 1), str);
+          if (*s == ';')
+            s++;
+          continue;
+        }
+        s++;
+      }
+      else {
+        int32_t m;
+        size_t bytes;
+
+        for ( ; isalnum(*s) ; s++) ;
+        bytes = (s - (unsigned char *)str - 1);
+        if (*s != ';' || !isalpha(str[1]) || bytes < 3) {
+          fprintf(stderr, "Malformed html symbol '%.*s' will be used literally.\n", (int)bytes + 2, str);
+          i = *str;
+          s = (unsigned char *)str;
+        }
+        /* do a binary search */
+        for (i = 0, j = sizeof(html_map)/sizeof(HTML_map) - 1, m = j >> 1 ; ; m = (r < 0 ? (i = m) + j : i + (j = m) + 1) >> 1) {
+          if ((r = strncmp(html_map[m].sym, str+1, bytes)) == 0)
+            if (html_map[m].sym[bytes] == 0)
+              break;
+            else
+              r = 1;
+          else if (i == j)
+            break;
+        }
+        if (r || strlen(html_map[m].sym) != bytes) {
+          fprintf(stderr, "Undefined html symbol '%.*s' will be used verbatim.\n", (int)bytes + 2, str);
+          i = *str;
+          s = (unsigned char *)str;
+        }
+        else {
+          i = html_map[m].utf;
+          s++;
+        }
+      }
+    }
+#endif
+    if ((map & 1) || s != (unsigned char *)str) {
+      if ((i >= 0x80 && i <= 0x9f) && ((map & 1) || toupper(str[1]) != 'U')) {
+        j = escANSI_map[i - 0x80];
+        /* when location dependent, the system conversion functions will deal with it */
+        i = ((j >> 16) == 0) ? j : j & 0xffff;
+      }
+      if (s == (unsigned char *)str)
+        s++;
+
+      /* generate the encoded multi-byte char which has i as its unicode value */
+      *(u = utf + 6) = '\0';
+      if (i >= 0x80) {
+        unsigned char mask;
+
+        // convert to utf8 encoded string
+        for (j = i, u-- ; (u - utf) > 1 && j >= 0x80 ; *u-- = (j & 0x3f) + 0x80, j >>= 6) ;
+        mask = 0xfe << (u - utf);
+        *u = (j & ~mask) + (mask << 1);
+      }
+      else
+        *--u = i;
+
+      if ((r = mbrtowc(&key.key, (const char *)u, 6 - (u - utf), &ps)) == -1) {
+        fprintf(stderr, "Escaped constant (0%lo = %lu = 0x%lX) is not a valid utf8 code.\n", (long int)i, (long int)i, (long int)i);
+        //return XDO_ERROR;
+      }
+    }
+    else {
+      // test utf-8 encoded string validity
+      if (*s >= 0x80) { // UTF encoded and need more than 1 byte?
+        int b;       // number of encoded bytes
+
+        u = s;
+        b = j = 2 + (*u >= 0xe0) + (*u >= 0xf0) + (*u >= 0xf8) + (*u >= 0xfc);
+        if ((i = (*u++ << j) & 0xff) < 0x80)
+          for (i >>= j ; b > 1 && (*u & 0xc0) == 0x80 ; b--, i = (i<<6) + (*u++ & 0x3f)) ;
+        if (b > 1) {
+          fprintf(stderr, "Error on multi-byte utf8 encoded string. Expected bytes %d, found %d.\n", j, b);
+          return XDO_ERROR;
+        }
+      }
+      else
+        j = 1;
+      memcpy(u = utf, s, j);
+      utf[j] = '\0';
+
+      if ((r = mbrtowc(&key.key, (const char *)u, j, &ps)) == -1) {
+        fprintf(stderr, "Invalid multi-byte sequence encountered\n");
+        s += j;
+        return XDO_ERROR;
+       }
+      else {
+        if (! r)
+          break;
+        s += r;
+      }
+    }
+
     _xdo_charcodemap_from_char(xdo, &key);
     if (key.code == 0 && key.symbol == NoSymbol) {
-      fprintf(stderr, "I don't what key produces '%lc', skipping.\n",
+      fprintf(stderr, "I don't know which key produces '%lc', skipping.\n",
               key.key);
       continue;
     } else {
@@ -986,7 +1167,7 @@ int xdo_enter_text_window(const xdo_t *xdo, Window window, const char *string, u
       //printf("sym: %s\n", XKeysymToString(key.symbol));
     }
 
-    //printf(stderr,
+    //fprintf(stderr,
             //"Key '%c' maps to code %d / sym %lu in group %d / mods %d (%s)\n",
             //key.key, key.code, key.symbol, key.group, key.modmask,
             //(key.needs_binding == 1) ? "needs binding" : "ok");
@@ -999,7 +1180,7 @@ int xdo_enter_text_window(const xdo_t *xdo, Window window, const char *string, u
 
     /* XXX: Flush here or at the end? or never? */
     //XFlush(xdo->xdpy);
-  } /* walk string generating a keysequence */
+  } /* walk throghout string generating key sequences */
 
   //free(keys);
   return XDO_SUCCESS;
@@ -1336,7 +1517,7 @@ static void _xdo_populate_charcode_map(xdo_t *xdo) {
     }
   }
   xdo->charcodes_len = idx;
-  XkbFreeClientMap(desc, 0, 1);
+  XkbFreeKeyboard(desc, 0, 1);
   XFreeModifiermap(modmap);
 }
 
